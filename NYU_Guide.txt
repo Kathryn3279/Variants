@@ -1,0 +1,87 @@
+#Align reads to reference (H37Rv_BD.fna) using BWA MEM- starting with ERR2514770--single end reads?
+
+#Index reference genome
+baw index H37Rv_BD.fna
+
+#Unsure of readgroup-- '@RG\tID:Test1\tSM:12.0612305'
+#Adding in placeholder platform information beacuse of error in BQSR step (PL:ILLUMINA\tPM:PlaceHolder)
+bwa mem -a -M -R '@RG\tID:Test1\tPL:ILLUMINA\tPM:PlaceHolder\tSM:12.0612305' H37RvBD.fna /store/home/mad/PROJECTS/CRISPRi/SNPs/FASTQ/ERR2514770/ERR2514770.fastq.gz > align_ERR2514770.sam
+
+#Sort SAM file by coordinate, convert to BAM with picard
+java -jar /store/genomics/picard.jar SortSam INPUT=align_ERR2514770.sam OUTPUT=sorted_align_ERR2514770.bam SORT_ORDER=coordinate
+
+#Collect alignment and insert size metrics with picard, R, and samtools--error in insertSizeMetrics
+java -jar /store/genomics/picard.jar CollectAlignmentSummaryMetrics R=H37RvBD.fna I=sorted_align_ERR2514770.bam O=align_metics.txt
+
+java -jar /store/genomics/picard.jar CollectInsertSizeMetrics INPUT=sorted_align_ERR2514770.bam OUTPUT=align_metics.txt HISTOGRAM_FILE=insert_size_hist.pdf
+
+samtools depth -a sorted_align_ERR2514770.bam > depth_out.txt
+
+#Marking duplicates with picard and index output BAM
+java -jar /store/genomics/picard.jar MarkDuplicates INPUT=sorted_align_ERR2514770.bam OUTPUT=nodup_align_ERR2514770.bam METRICS_FILE=metrics.txt
+java -jar /store/genomics/picard.jar BuildBamIndex INPUT=nodup_align_ERR2514770.bam
+
+#Realigning around indels is no longer supported in GATK4-- skip this (Steps 6 & 7)
+
+#First round of variant calling with GATK- these will be filtered and provided as input for Base Quality Score Recalibration
+#Note, had to create ref index (fna.fai with samtools faidx H37RvBD.fna) and ref dict file (H37RvBD.dict with java -jar /store/genomics/picard.jar CreateSequenceDictionary -R H37RvBD.fna -O H37RvBD.dict)
+
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar HaplotypeCaller -R H37RvBD.fna -I nodup_align_ERR2514770.bam -O raw_variants.vcf
+
+#Separate SNPs and indels with SelectVariants (run twice to split out SNP and INDEL with selectType)-- is it normal #to have so few indels 218 v 2302 snps?
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar SelectVariants -R H37RvBD.fna -V raw_variants.vcf -select-type SNP -O raw_snps.vcf
+
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar SelectVariants -R H37RvBD.fna -V raw_variants.vcf -select-type INDEL -O raw_indels.vcf
+
+#Select variants that pass quality control (unsure of values, using those cutoffs listed in NYU guide/Broad site)
+#This creates the "basic_snp_filter" which indicates meets these guidlines and are bad reads-- 2222snps v 4indels
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar VariantFiltration -R H37RvBD.fna -V raw_snps.vcf -filter "QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0 || SOR > 4.0" --filter-name "basic_snp_filter" -O filtered_snps.vcf > stdOut
+
+#Select indels that pass qaulity control-- different values than above-- to have so few indels 5 v 2302 snps
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar VariantFiltration -R H37RvBD.fna -V raw_indels.vcf -filter "QD < 2.0 || FS > 200.0 || ReadPosRankSum < -20 || SOR > 10.0"  --filter-name "basic_indel_filter" -O filtered_indels.vcf > indelStOut
+
+#Base quality score recalibration num.1
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar BaseRecalibrator -R H37RvBD.fna -I nodup_align_ERR2514770.bam -known-sites filtered_snps.vcf -known-sites filtered_indels.vcf -O recal_data.table
+
+
+##
+#recal number 2 (want to use --BQSR argument to input covariates table for base QS recalibration)
+##This pass is optional but required for producing a recalibration report-- for now will skil this b/c BQSR error
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar Baserecalibrator -R H37RvBD.fna -I nodup_align_ERR2514770.bam --BQSR recal_data.table -O post_recal_data.table 
+
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar BaseRecalibrator -R H37RvBD.fna -I recal_reads.bam -known-sites filtered_snps.vcf -known-sites filtered_indels.vcf -O post_recal_data.table
+
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar AnalyzeCovariates -R H37RvBD.fna -before recal_data.table -after post_recal_data.table -plots recal_plots.pdf
+
+##
+
+
+#Apply recalibration to create new bam file-- replaces PrintReads in earlier GATK versions
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar ApplyBQSR -R H37RvBD.fna -I nodup_align_ERR2514770.bam -bqsr recal_data.table -O recal_reads.bam
+
+#Create recalibration plot- had to install package (gsalib) in R first-- plots show recalibration moves quality score#s closer to empirical value 
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar AnalyzeCovariates -before recal_data.table -after post_recal_data.table -plots recalPlot.pdf
+
+#Call variants on recalibrated bam
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar HaplotypeCaller -R H37RvBD.fna -I recal_reads.bam -O raw_variants_recal.vcf
+
+#Extract SNPs and INDELs from the recalibrated raw variants
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar SelectVariants -R H37RvBD.fna -V raw_variants_recal.vcf -select-type SNP -O raw_snps_recal.vcf
+
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar SelectVariants -R H37RvBD.fna -V raw_variants_recal.vcf -select-type INDEL -O raw_indels_recal.vcf
+
+#Filter SNPs for those that pass quality control after recalibration
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar VariantFiltration -R H37RvBD.fna -V raw_snps_recal.vcf -filter "QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0 || SOR > 4.0" --filter-name "basic_snp_filter" -O filtered_snps_final.vcf
+
+#Filter INDELs for those that passs quality control after recalibration
+/usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java -jar /store/genomics/gatk-4.1.2.0/gatk-package-4.1.2.0-local.jar VariantFiltration -R H37RvBD.fna -V raw_indels_recal.vcf -filter "QD < 2.0 || FS > 200.0 ||  ReadPosRankSum < -20.0 || SOR > 10.0" --filter-name "basic_indel_filter" -O filtered_indels_final.vcf
+
+#Annotate SNPS and predict effect with SnpEff-- if calling from outside directory need to specify location of configuration file-- -c /store/home/mad/PROJECTS/CRISPRi/SNPs/snpEff/snpEff.config
+#Chromosome names in snpEff database and input vcf are different- change input name to match ('Chromosome')
+
+cat filtered_snps_final.vcf | sed "s/^NC_018143.2/Chromosome/" > filtered_snps_final_updated.vcf
+
+java -jar /store/home/mad/PROJECTS/CRISPRi/SNPs/snpEff/snpEff.jar -c /store/home/mad/PROJECTS/CRISPRi/SNPs/snpEff/snpEff.config Mycobacterium_tuberculosis_h37rv_gca_000277735 filtered_snps_final_updated.vcf > filtered_snps_final.ann.vcf
+
+
+
